@@ -22,28 +22,58 @@ class BootloaderFlasher:
     def log_error(self, message):
         print(f"\n[-] ERROR: {message}", file=sys.stderr)
 
+    def _open_serial_port(self, timeout_limit=10.0):
+        """Attempts to open or reopen the serial port within a timeout window."""
+        start_time = time.time()
+        while (time.time() - start_time) < timeout_limit:
+            try:
+                self.ser = serial.Serial(
+                    port=self.port,
+                    baudrate=self.baudrate,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.1,  # 100ms read timeout
+                )
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+                return True
+            except (serial.SerialException, OSError):
+                # Device file might not exist or be locked while OS reconstructs it
+                time.sleep(0.2)
+        return False
+
+    def _reconnect_serial_port(self):
+        """Safely tears down old descriptor handle and attempts recovery loop."""
+        self.log_state("MCU resetting. Disconnecting old handle and waiting for port...")
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        
+        # Small cooling delay before probing the OS for the new virtual COM file structure
+        time.sleep(0.5)
+        
+        if self._open_serial_port(timeout_limit=10.0):
+            self.log_state(f"Successfully reconnected to {self.port}!")
+            return True
+        else:
+            self.log_error(f"Failed to reconnect to {self.port} within 10 seconds.")
+            return False
+
     def run(self):
         # Verify the SREC file exists before opening the serial port
         if not os.path.isfile(self.srec_path):
             self.log_error(f"SREC file not found at path: {self.srec_path}")
             sys.exit(1)
 
-        try:
-            self.ser = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=0.1,  # 100ms read timeout
-            )
-        except serial.SerialException as e:
-            self.log_error(f"Could not open serial port {self.port}: {e}")
+        self.log_state(f"Attempting connection to {self.port}...")
+        if not self._open_serial_port(timeout_limit=10.0):
+            self.log_error(f"Could not open serial port {self.port} within 10 seconds.")
             sys.exit(1)
 
         self.log_state(f"Connected to {self.port} at {self.baudrate} baud.")
-        self.ser.reset_input_buffer()
-        self.ser.reset_output_buffer()
 
         try:
             # ---- STEP 1: INITIAL PASSIVE MONITORING (3 SECONDS) ----
@@ -63,15 +93,30 @@ class BootloaderFlasher:
 
                 # ---- STEP 2: SEND RESET COMMAND ----
                 self.log_state("Sending 'reset' command...")
-                self.ser.write(b"reset\n")
-                self.ser.flush()
+                try:
+                    self.ser.write(b"reset\n")
+                    self.ser.flush()
+                except (serial.SerialException, OSError) as e:
+                    self.log_error(f"Failed to send reset token: {e}")
+                    return False
 
                 # ---- STEP 3: WAIT FOR RESET ACK ----
                 self.log_state("Waiting for 'reset ack'...")
-                if not self._wait_for_string("reset ack", timeout_sec=2.0):
-                    self.log_error("Timeout waiting for 'reset ack'")
+                # Note: If your app breaks connections immediately on reset write, 
+                # this block handles clean failover directly to reconnection logic.
+                try:
+                    ack_received = self._wait_for_string("reset ack", timeout_sec=2.0)
+                except (serial.SerialException, OSError):
+                    ack_received = False
+                    
+                if not ack_received:
+                    self.log_state("Port dropped during reset write (Expected behavior). Proceeding to reconnect...")
+                else:
+                    self.log_state("Reset Successful")
+
+                # ---- STEP 3.5: WAIT FOR PORT REAPPEARANCE AND RECONNECT ----
+                if not self._reconnect_serial_port():
                     return False
-                self.log_state("Reset Successful")
 
                 # ---- STEP 4: POST-RESET BOOTING CAPTURE ----
                 self.log_state("Waiting for post-reset 'booting' frame...")
@@ -96,21 +141,26 @@ class BootloaderFlasher:
             return self._stream_srec_file()
 
         finally:
-            self.ser.close()
-            self.log_state("Serial port closed cleanly.")
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+                self.log_state("Serial port closed cleanly.")
 
     def _wait_for_string(self, target_str, timeout_sec):
         """Helper to search for target tokens within a timeframe."""
         start_time = time.time()
         buffer = ""
         while (time.time() - start_time) < timeout_sec:
-            if self.ser.in_waiting > 0:
-                raw_chars = self.ser.read(self.ser.in_waiting).decode(
-                    "utf-8", errors="ignore"
-                )
-                buffer += raw_chars
-                if target_str in buffer:
-                    return True
+            try:
+                if self.ser.in_waiting > 0:
+                    raw_chars = self.ser.read(self.ser.in_waiting).decode(
+                        "utf-8", errors="ignore"
+                    )
+                    buffer += raw_chars
+                    if target_str in buffer:
+                        return True
+            except (serial.SerialException, OSError):
+                # Handle unexpected mid-read drop exceptions gracefully
+                return False
             time.sleep(0.005)
         return False
 
@@ -138,8 +188,13 @@ class BootloaderFlasher:
             payload = (line + "\n").encode("utf-8")
 
             # Send the line out to the serial port
-            self.ser.write(payload)
-            self.ser.flush()
+            try:
+                self.ser.write(payload)
+                self.ser.flush()
+            except (serial.SerialException, OSError) as e:
+                print(" ]")
+                self.log_error(f"Write error during data streaming: {e}")
+                return False
 
             # MANDATORY: Wait for a tick back for EVERY line (S0, S1, S2, S3, S7, S8, S9)
             if not self._wait_for_tick(timeout_sec=40.0):
@@ -162,11 +217,14 @@ class BootloaderFlasher:
         """Waits for the bootloader's custom character token validation string."""
         start_time = time.time()
         while (time.time() - start_time) < timeout_sec:
-            if self.ser.in_waiting > 0:
-                char = self.ser.read(1).decode("utf-8", errors="ignore")
-                if char == ".":
-                    print(".", end="", flush=True)  # Echo to terminal window
-                    return True
+            try:
+                if self.ser.in_waiting > 0:
+                    char = self.ser.read(1).decode("utf-8", errors="ignore")
+                    if char == ".":
+                        print(".", end="", flush=True)  # Echo to terminal window
+                        return True
+            except (serial.SerialException, OSError):
+                return False
             time.sleep(0.001)
         return False
 
